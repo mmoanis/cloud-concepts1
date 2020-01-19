@@ -76,6 +76,15 @@ public:
 	void initMemberListTable(Member *memberNode);
 	void printAddress(Address *addr);
 	virtual ~MP1Node();
+
+	string debugMessage(char *msg, int size);
+
+	void sendMembershipListTo(Address *toaddr, MsgTypes type);
+
+	bool handleJoinRequestMessage(char *data, int size);
+	bool handleJoinReplyMessage(char *data, int size);
+
+	vector<MemberListEntry>::iterator addNewMember(int id, short port, long heartbeat, long timestamp);
 };
 
 #endif /* _MP1NODE_H_ */
