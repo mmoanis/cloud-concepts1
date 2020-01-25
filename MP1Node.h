@@ -31,6 +31,7 @@
 enum MsgTypes{
     JOINREQ,
     JOINREP,
+	GOSSIP,
     DUMMYLASTMSGTYPE
 };
 
@@ -80,11 +81,13 @@ public:
 	string debugMessage(char *msg, int size);
 
 	void sendMembershipListTo(Address *toaddr, MsgTypes type);
+	bool receiveMembershipList(char *data, int size); 
 
 	bool handleJoinRequestMessage(char *data, int size);
 	bool handleJoinReplyMessage(char *data, int size);
+	bool handleGossipMessage(char *data, int size);
 
-	vector<MemberListEntry>::iterator addNewMember(int id, short port, long heartbeat, long timestamp);
+	void addMember(int id, short port, long heartbeat);
 };
 
 #endif /* _MP1NODE_H_ */

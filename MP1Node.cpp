@@ -109,7 +109,9 @@ int MP1Node::initThisNode(Address *joinaddr) {
 	memberNode->timeOutCounter = -1;
     initMemberListTable(memberNode);
 
-    memberNode->myPos = addNewMember(id, port, memberNode->heartbeat, memberNode->heartbeat);
+    addMember(id, port, memberNode->heartbeat);
+    
+    memberNode->myPos = memberNode->memberList.begin();
 
     return 0;
 }
@@ -147,7 +149,11 @@ int MP1Node::introduceSelfToGroup(Address *joinaddr) {
 #endif
 
         // send JOINREQ message to introducer member
-        emulNet->ENsend(&memberNode->addr, joinaddr, (char *)msg, msgsize);
+        if (0 == emulNet->ENsend(&memberNode->addr, joinaddr, (char *)msg, msgsize)) {
+#ifdef DEBUGLOG
+            log->LOG(&memberNode->addr, "IntroduceSelfToGroup ENsend failed");
+#endif
+        }
 
         free(msg);
     }
@@ -219,7 +225,14 @@ void MP1Node::checkMessages() {
  * DESCRIPTION: Message handler for different message types
  */
 bool MP1Node::recvCallBack(void *env, char *data, int size ) {
-	if (size < sizeof(MessageHdr)) return false;
+    //log->LOG(&memberNode->addr, "Received msg %s", debugMessage(data, size).c_str());
+    int expected_size = sizeof(MessageHdr);
+	if (size < expected_size) {
+#ifdef DEBUGLOG
+        log->LOG(&memberNode->addr, "Unexpected message with size %d", size);
+#endif
+        return false;
+    }
 
     MessageHdr *msg = (MessageHdr *) data;
     switch (msg->msgType)
@@ -228,6 +241,8 @@ bool MP1Node::recvCallBack(void *env, char *data, int size ) {
         return handleJoinRequestMessage(data, size);
     case JOINREP:
         return handleJoinReplyMessage(data, size);
+    case GOSSIP:
+        return handleGossipMessage(data, size);
     
     default:
         return false;
@@ -245,48 +260,49 @@ bool MP1Node::handleJoinRequestMessage(char *data, int size) {
     Address toaddr;
     *(int*)(toaddr.addr) = *(int*)addr;
 	*(short *)(&toaddr.addr[4]) = *(short*)(&addr[4]);
+#ifdef DEBUGLOG
+    log->LOG(&memberNode->addr, "Sending JoinReply to %s", toaddr.getAddress().c_str());
+#endif
     
     // Send the membership list as JOINREP message
     sendMembershipListTo(&toaddr, JOINREP);
 
     int id = *(int *)(&addr[0]);
     short port = *(short *)(&addr[4]);
-    addNewMember(id, port, heartbeat, memberNode->heartbeat);
+    addMember(id, port, heartbeat);
 
     return true;
 }
 
 bool MP1Node::handleJoinReplyMessage(char *data, int size) {
     MessageHdr *hdr = (MessageHdr *) data;
-    int expected_size = sizeof(MessageHdr) + sizeof(int);
-    if (size < expected_size) return false;
 
-    int members_count;
-    memcpy(&members_count, (char *) (hdr+1), sizeof(int));
-    expected_size += members_count * (sizeof(int) + sizeof(short) + sizeof(long));
-    if (size < expected_size) return false;
-    
+    if (!receiveMembershipList((char *) (hdr+1), size - sizeof(MessageHdr))) {
 #ifdef DEBUGLOG
-    log->LOG(&memberNode->addr, "Received member list %d", members_count);
+        log->LOG(&memberNode->addr, "JOINREP failed...");
 #endif
-
-    char *msg = ((char *) (hdr+1) + sizeof(int));
-    for (int i = 0; i < members_count; i++) {
-        int id;
-        short port;
-        long heartbeat;
-
-        memcpy(&id, msg, sizeof(int));
-        memcpy(&port, msg + sizeof(int), sizeof(short));
-        memcpy(&heartbeat, msg + sizeof(int) + sizeof(short), sizeof(long));
-        msg += sizeof(short) + sizeof(int) + sizeof(long);
-
-        addNewMember(id, port, heartbeat, memberNode->heartbeat);
+        return false;
     }
 
-    memberNode->nnb = members_count;
+    memberNode->inGroup = true;
 
     return true;
+}
+
+bool MP1Node::handleGossipMessage(char *data, int size)
+{
+    int expected_size = sizeof(MessageHdr);
+    MessageHdr *hdr = (MessageHdr *) data;
+    if (size < expected_size) {
+#ifdef DEBUGLOG
+        log->LOG(&memberNode->addr, "HandleGossip expected message size %d got %d", expected_size, size);
+#endif
+        return false;
+    }
+
+    memberNode->inGroup = true;
+
+    return receiveMembershipList((char *) (hdr+1), size - expected_size);
 }
 
 /**
@@ -297,7 +313,45 @@ bool MP1Node::handleJoinReplyMessage(char *data, int size) {
  * 				Propagate your membership list
  */
 void MP1Node::nodeLoopOps() {
+    // Update local clock
     memberNode->heartbeat++;
+    memberNode->myPos->heartbeat = memberNode->heartbeat;
+    memberNode->myPos->timestamp = memberNode->heartbeat;
+
+    for (auto member = memberNode->memberList.begin(); member != memberNode->memberList.end();) {
+        if (member->gettimestamp() + TFAIL + TREMOVE <= memberNode->heartbeat) {
+            Address addr;
+            *(int*)(addr.addr) = member->getid();
+            *(short *)(&addr.addr[4]) = member->getport();
+            log->logNodeRemove(&memberNode->addr, &addr);
+            member = memberNode->memberList.erase(member);
+            memberNode->nnb--;
+        } else {
+            ++member;
+        }
+    }
+    
+    // Update my position in the list in case list was modified
+    memberNode->myPos = memberNode->memberList.begin();
+
+    // Check if its time to send ping
+    memberNode->pingCounter--;
+    if (memberNode->pingCounter == 0) {
+        for (auto member = memberNode->memberList.begin(); member != memberNode->memberList.end(); ++member) {
+            if (member == memberNode->myPos) continue;
+
+            Address toaddr;
+            *(int*)(toaddr.addr) = member->getid();
+            *(short *)(&toaddr.addr[4]) = member->getport();
+            sendMembershipListTo(&toaddr, GOSSIP);
+
+#ifdef DEBUGLOG
+            log->LOG(&memberNode->addr, "GOSSIP to %d:%d", member->getid(), member->getport());           
+#endif
+        }
+
+        memberNode->pingCounter = TFAIL;
+    }
 
     return;
 }
@@ -346,16 +400,60 @@ void MP1Node::printAddress(Address *addr)
                                                        addr->addr[3], *(short*)&addr->addr[4]) ;    
 }
 
-vector<MemberListEntry>::iterator MP1Node::addNewMember(int id, short port, long heartbeat, long timestamp) {
+void MP1Node::addMember(int id, short port, long heartbeat) {
+    // Don't add the node itself again to the list
+    if (!memberNode->memberList.empty() && memberNode->myPos->getid() == id && memberNode->myPos->getport() == port) {
 #ifdef DEBUGLOG
-    log->LOG(&memberNode->addr, "Added new member %d:%d", id, port);
+        log->LOG(&memberNode->addr, "Trying to add node to itself...");
 #endif
+        return;
+    }
+
+    // Discard old nodes
+    if (heartbeat + TFAIL + TREMOVE <= memberNode->heartbeat) {
+#ifdef DEBUGLOG
+        log->LOG(&memberNode->addr, "Trying to add a failed node %d:%d", id, port);
+#endif
+        return;
+    }
+
+    // Check if member exist
+    for (auto member = memberNode->memberList.begin(); member != memberNode->memberList.end(); ++member) {
+        if (member->getid() == id && member->getport() == port) {
+            // Update the member heartbeat and the timestamp which indicate last update based on local clock
+            if (member->getheartbeat() < heartbeat) {
+#ifdef DEBUGLOG
+                log->LOG(&memberNode->addr, "Update member %d:%d heartbeat %d -> %d ",
+                        member->getid(), member->getport(), member->getheartbeat(), heartbeat);
+#endif
+                member->heartbeat = heartbeat;
+                member->timestamp = memberNode->heartbeat;
+            }
+
+            return;
+        }
+    }
+
+    // Add new member
+    Address addr;
+    *(int*)(addr.addr) = id;
+    *(short *)(&addr.addr[4]) = port;
+    log->logNodeAdd(&memberNode->addr, &addr);
+
     memberNode->nnb++;
-    return memberNode->memberList.insert(memberNode->memberList.end(), MemberListEntry(id, port, heartbeat, timestamp));
+    memberNode->memberList.insert(memberNode->memberList.end(), MemberListEntry(id, port, heartbeat, memberNode->heartbeat));
+
+    return;
 }
 
 void MP1Node::sendMembershipListTo(Address *toaddr, MsgTypes type) {
-    const int members_count = memberNode->nnb;
+    // Don't send to self
+    if (toaddr->getAddress() == memberNode->addr.getAddress()) {
+        log->LOG(&memberNode->addr, "Trying to send membership to self...");
+        return;
+    }
+
+    const int members_count = memberNode->memberList.size();
     const int member_size = sizeof(short) + sizeof(int) + sizeof(long);
     const size_t msgsize = 1 + sizeof(MessageHdr) + sizeof(int) + members_count * (member_size);
 
@@ -368,19 +466,65 @@ void MP1Node::sendMembershipListTo(Address *toaddr, MsgTypes type) {
     char *data = ((char*)(hdr+1) + sizeof(int));
 
     for (MemberListEntry& entry : memberNode->memberList) {
-        //char addr[6];
-        //memcpy(&addr[0], &entry.id, sizeof(int));
-        //memcpy(&addr[4], &entry.port, sizeof(short));
         memcpy(data, &entry.id, sizeof(int));
         memcpy(data + sizeof(int), &entry.port, sizeof(short));
-        // memcpy(data, &addr[0], sizeof(addr));
         memcpy(data + sizeof(int) + sizeof(short), &entry.heartbeat, sizeof(long));
         data += sizeof(short) + sizeof(int) + sizeof(long);
     }
 
-    emulNet->ENsend(&memberNode->addr, toaddr, msg, msgsize);
+    if (emulNet->ENsend(&memberNode->addr, toaddr, msg, msgsize) == 0) {
+#ifdef DEBUGLOG
+        log->LOG(&memberNode->addr, "SendMembership ENsend failed");
+#endif
+    }
 
     free(msg);    
+}
+
+bool MP1Node::receiveMembershipList(char *data, int size)
+{
+    int expected_size = sizeof(int);
+    if (size < expected_size) {
+#ifdef DEBUGLOG
+        log->LOG(&memberNode->addr, "ReceiveMembership expected message size %d got %d", expected_size, size);
+#endif
+        return false;
+    }
+
+    int members_count;
+    memcpy(&members_count, data, sizeof(int));
+    
+    expected_size += members_count * (sizeof(int) + sizeof(short) + sizeof(long));
+    if (size < expected_size) {
+#ifdef DEBUGLOG
+        log->LOG(&memberNode->addr, "ReceiveMembership expected message size %d got %d", expected_size, size);
+#endif
+        return false;
+    }
+    
+#ifdef DEBUGLOG
+    log->LOG(&memberNode->addr, "Received member list %d", members_count);
+#endif
+
+    char *msg = data + sizeof(int);
+    for (int i = 0; i < members_count; i++) {
+        int id;
+        short port;
+        long heartbeat;
+
+        memcpy(&id, msg, sizeof(int));
+        memcpy(&port, msg + sizeof(int), sizeof(short));
+        memcpy(&heartbeat, msg + sizeof(int) + sizeof(short), sizeof(long));
+        msg += sizeof(short) + sizeof(int) + sizeof(long);
+
+        // Avoid adding ourselves
+        if (!(id == memberNode->myPos->getid() && port == memberNode->myPos->getport())) {
+            addMember(id, port, heartbeat);
+        }
+    }
+
+    memberNode->nnb = members_count;
+    return true;
 }
 
 string MP1Node::debugMessage(char *msg, int size) {
